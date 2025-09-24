@@ -5,6 +5,9 @@ import tempfile
 import shutil
 from pathlib import Path
 import logging
+import click
+import sys
+from typing import Optional, Dict, Any
 
 # Define the Modal app
 app = modal.App("docker-to-bootable-img")
@@ -31,7 +34,8 @@ docker_converter_image = (
     ])
     .pip_install([
         "docker",
-        "requests"
+        "requests",
+        "click"
     ])
 )
 
@@ -311,24 +315,203 @@ def cleanup_conversion_files() -> dict:
         return {"status": "success", "message": "All conversion files cleaned up"}
     return {"status": "info", "message": "No files to clean up"}
 
-# Local entrypoint for testing
+# CLI Interface using Click
+@click.group()
+@click.option('--verbose', '-v', is_flag=True, help='Enable verbose output')
+@click.pass_context
+def cli(ctx, verbose):
+    """Docker to Bootable .img Converter - Modal.com CLI"""
+    ctx.ensure_object(dict)
+    ctx.obj['verbose'] = verbose
+    if verbose:
+        click.echo("Verbose mode enabled")
+
+@cli.command()
+@click.argument('docker_image')
+@click.option('--output', '-o', default='bootable_system.img', 
+              help='Output filename for the .img file')
+@click.option('--size', '-s', default=2048, type=int,
+              help='Disk size in MB (default: 2048)')
+@click.option('--filesystem', '-f', default='ext4', 
+              type=click.Choice(['ext4', 'ext3', 'ext2']),
+              help='Filesystem type (default: ext4)')
+@click.option('--wait/--no-wait', default=True,
+              help='Wait for conversion to complete (default: wait)')
+@click.pass_context
+def convert(ctx, docker_image, output, size, filesystem, wait):
+    """Convert a Docker image to a bootable .img file"""
+    verbose = ctx.obj['verbose']
+    
+    if verbose:
+        click.echo(f"Converting {docker_image} to {output}")
+        click.echo(f"Disk size: {size}MB, Filesystem: {filesystem}")
+    
+    try:
+        click.echo(f"Starting conversion of {docker_image}...")
+        
+        if wait:
+            # Synchronous call - wait for result
+            result = convert_docker_to_bootable_img.remote(
+                docker_image=docker_image,
+                output_filename=output,
+                disk_size_mb=size,
+                filesystem_type=filesystem
+            )
+            
+            if result['status'] == 'success':
+                click.echo(click.style("✓ Conversion completed successfully!", fg='green'))
+                click.echo(f"Output file: {result['output_file']}")
+                click.echo(f"File size: {result['file_size_mb']}MB")
+            else:
+                click.echo(click.style("✗ Conversion failed!", fg='red'))
+                click.echo(f"Error: {result.get('error', 'Unknown error')}")
+                sys.exit(1)
+        else:
+            # Asynchronous call - spawn and return immediately
+            function_call = convert_docker_to_bootable_img.spawn(
+                docker_image=docker_image,
+                output_filename=output,
+                disk_size_mb=size,
+                filesystem_type=filesystem
+            )
+            click.echo(f"Conversion started asynchronously")
+            click.echo(f"Function call ID: {function_call.object_id}")
+            click.echo("Use 'status' command to check progress")
+            
+    except Exception as e:
+        click.echo(click.style(f"✗ Error: {str(e)}", fg='red'))
+        sys.exit(1)
+
+@cli.command()
+@click.pass_context  
+def list(ctx):
+    """List all converted .img files"""
+    verbose = ctx.obj['verbose']
+    
+    try:
+        files = list_conversion_files.remote()
+        
+        if not files:
+            click.echo("No .img files found")
+            return
+            
+        click.echo(f"Found {len(files)} .img file(s):")
+        click.echo()
+        
+        # Table header
+        click.echo(f"{'Filename':<30} {'Size (MB)':<12} {'Path'}")
+        click.echo("-" * 70)
+        
+        for file_info in files:
+            click.echo(f"{file_info['filename']:<30} {file_info['size_mb']:<12} {file_info['path']}")
+            
+    except Exception as e:
+        click.echo(click.style(f"✗ Error: {str(e)}", fg='red'))
+        sys.exit(1)
+
+@cli.command()
+@click.confirmation_option(prompt='Are you sure you want to delete all conversion files?')
+@click.pass_context
+def cleanup(ctx):
+    """Clean up all conversion files"""
+    verbose = ctx.obj['verbose']
+    
+    try:
+        result = cleanup_conversion_files.remote()
+        
+        if result['status'] == 'success':
+            click.echo(click.style("✓ All conversion files cleaned up", fg='green'))
+        else:
+            click.echo(click.style(f"ℹ {result['message']}", fg='yellow'))
+            
+    except Exception as e:
+        click.echo(click.style(f"✗ Error: {str(e)}", fg='red'))
+        sys.exit(1)
+
+@cli.command()
+@click.argument('function_call_id')
+@click.pass_context
+def status(ctx, function_call_id):
+    """Check the status of an asynchronous conversion"""
+    verbose = ctx.obj['verbose']
+    
+    try:
+        # Reconstruct FunctionCall object from ID
+        import modal
+        function_call = modal.FunctionCall.from_id(function_call_id)
+        
+        try:
+            # Try to get result (non-blocking)
+            result = function_call.get(timeout=0)
+            
+            if result['status'] == 'success':
+                click.echo(click.style("✓ Conversion completed successfully!", fg='green'))
+                click.echo(f"Output file: {result['output_file']}")
+                click.echo(f"File size: {result['file_size_mb']}MB")
+            else:
+                click.echo(click.style("✗ Conversion failed!", fg='red'))
+                click.echo(f"Error: {result.get('error', 'Unknown error')}")
+                
+        except TimeoutError:
+            click.echo(click.style("⏳ Conversion still in progress...", fg='yellow'))
+            
+    except Exception as e:
+        click.echo(click.style(f"✗ Error: {str(e)}", fg='red'))
+        sys.exit(1)
+
+@cli.command()
+@click.pass_context
+def examples(ctx):
+    """Show usage examples"""
+    examples_text = """
+Docker to Bootable .img Converter - Usage Examples
+
+Basic conversion:
+  python docker_converter.py convert alpine:latest
+
+Custom output filename and size:
+  python docker_converter.py convert ubuntu:20.04 --output ubuntu-dev.img --size 4096
+
+Different filesystem:
+  python docker_converter.py convert nginx:alpine --filesystem ext3 --size 1024
+
+Asynchronous conversion (don't wait):
+  python docker_converter.py convert large-image:latest --no-wait
+
+List all generated files:
+  python docker_converter.py list
+
+Clean up all files:
+  python docker_converter.py cleanup
+
+Check status of async conversion:
+  python docker_converter.py status fc-abc123
+
+Verbose mode:
+  python docker_converter.py --verbose convert alpine:latest
+"""
+    click.echo(examples_text)
+
+# Local entrypoint for CLI
 @app.local_entrypoint()
 def main():
-    """Example usage of the Docker to bootable .img converter"""
+    """CLI entrypoint that forwards to Click"""
+    cli()
+
+# Alternative entrypoint for testing
+@app.local_entrypoint()
+def test():
+    """Test the conversion with Alpine Linux"""
+    click.echo("Running test conversion with Alpine Linux...")
     
-    # Convert an Alpine Linux container to bootable image
     result = convert_docker_to_bootable_img.remote(
         docker_image="alpine:latest",
-        output_filename="alpine_bootable.img", 
+        output_filename="alpine_test.img",
         disk_size_mb=1024,
         filesystem_type="ext4"
     )
     
-    print("Conversion result:", result)
-    
-    # List converted files
-    files = list_conversion_files.remote()
-    print("\nConverted files:", files)
+    click.echo(f"Test result: {result}")
 
 if __name__ == "__main__":
-    main()
+    cli()
